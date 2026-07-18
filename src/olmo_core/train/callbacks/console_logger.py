@@ -35,6 +35,11 @@ class ConsoleLoggerCallback(Callback):
             "train/CE loss",
             "train/PPL",
             "train/Z loss",
+            # Bolmo's train module records its losses under a bolmo/* namespace
+            # (train/bolmo/ce, train/bolmo/local_encoder_loss, ...), which none of
+            # the names above match -- so byteification runs printed no loss at all
+            # to the console and were only observable via W&B.
+            "train/bolmo/*",
             "train/load balancing loss",
             "train/router Z loss",
             "train/block */load imbalance",
