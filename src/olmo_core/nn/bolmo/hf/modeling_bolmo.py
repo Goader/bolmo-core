@@ -754,18 +754,19 @@ class BolmoLocalDecoder(nn.Module):
                 h = embeds + h_patch
 
                 self.last_value.copy_(h_patch[:, -1])
+
+                # the global fired for the whole (barrier-aligned) batch -> every row advances
+                layer_cache_mask = None
             else:
                 h = embeds + self.last_value.unsqueeze(1)
 
-            # skip pad positions until we get a new value from the global model
-            if patch_embeds.numel() == 0:
-                h = boundary_state.selective_get(h, inv=True)
-            else:
-                boundary_state = None
+                # static-shape decode: run the full batch and freeze idle (at-boundary) rows via
+                # the mask instead of gathering the active subset. Keeps a fixed batch dim for
+                # torch.compile and returns full-batch logits (loop reconciles with `where`).
+                layer_cache_mask = boundary_state
 
-            if h.shape[0] > 0:
-                for i, layer in enumerate(self.layers):
-                    h = layer(h, past_key_values=self.layer_states[i], use_cache=True, cache_mask=boundary_state)
+            for i, layer in enumerate(self.layers):
+                h = layer(h, past_key_values=self.layer_states[i], use_cache=True, cache_mask=layer_cache_mask)
 
             self.cache_seqlens += h.shape[1]
 
@@ -1313,8 +1314,13 @@ class BolmoForCausalLM(BolmoPreTrainedModel, GenerationMixin):
                 # every unfinished example emits a byte token this step
                 emit_mask = ~finished
             else:
-                next_tokens[:] = self.model.tokenizer.bpe_token_end_id # type: ignore
-                boundary_state.selective_put(new_next_tokens, next_tokens, inv=True)
+                # decoder now returns full-batch logits; non-boundary (mid-patch) rows take their
+                # generated token, boundary (idle) rows keep the bpe_token_end sentinel
+                next_tokens = torch.where(
+                    boundary_state.mask,
+                    torch.full_like(new_next_tokens, self.model.tokenizer.bpe_token_end_id),
+                    new_next_tokens,
+                )
                 # only non-boundary (still mid-patch), unfinished examples emit
                 emit_mask = boundary_state.inv_mask & ~finished
 
