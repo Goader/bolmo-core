@@ -52,6 +52,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 1))
 N_BATCHES = int(os.environ.get("N_BATCHES", 1))
 PREFILL_ONLY = os.environ.get("PREFILL_ONLY", "0") == "1"
 AVG_BYTES_PER_TOKEN = float(os.environ.get("AVG_BYTES_PER_TOKEN", 4.3))
+COMPILE = os.environ.get("COMPILE", "1") == "1"
 
 def main(run_name: str, overrides: list[str]):
     save_path = join_path(SAVE_FOLDER, f"{run_name}_generation_benchmark.json")
@@ -216,7 +217,7 @@ def main(run_name: str, overrides: list[str]):
             tokenizer,
             BolmoConfig(teacher_force_boundaries=True),
             generation_config,
-            compile_model=True,
+            compile_model=COMPILE,
             device=torch.device("cuda"),
         )
         generate_kwargs = {
@@ -226,7 +227,7 @@ def main(run_name: str, overrides: list[str]):
         generation_module = TransformerGenerationModule(
             model,
             generation_config,
-            compile_model=True,
+            compile_model=COMPILE,
             device=torch.device("cuda"),
         )
         generate_kwargs = {}
