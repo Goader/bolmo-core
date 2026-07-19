@@ -154,6 +154,16 @@ def convert_checkpoint_to_hf(
         )
         model_state_dict = dist_cp_sd.get_model_state_dict(model, options=state_dict_options)
 
+        # Bolmo Stage-1/2 checkpoints are BolmoDistillTransformer and carry the frozen
+        # distillation teacher (teacher.*), used only for the training loss. The inference
+        # HF Bolmo model has no teacher, so drop those keys -- they have no HF mapping and
+        # otherwise trip the state converter's "some state keys were not converted" guard.
+        teacher_keys = [k for k in model_state_dict if k.startswith("teacher.")]
+        for k in teacher_keys:
+            del model_state_dict[k]
+        if teacher_keys:
+            log.info(f"Dropped {len(teacher_keys)} distillation-teacher keys before HF conversion")
+
         if (moe_config := model_config.block.feed_forward_moe) is not None:
             if moe_config.name == MoEType.dropless:
                 for k, v in model_state_dict.items():
