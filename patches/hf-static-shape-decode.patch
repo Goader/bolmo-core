@@ -1,0 +1,150 @@
+diff --git a/src/olmo_core/nn/bolmo/hf/modeling_bolmo.py b/src/olmo_core/nn/bolmo/hf/modeling_bolmo.py
+index 7d477be..3b818ad 100644
+--- a/src/olmo_core/nn/bolmo/hf/modeling_bolmo.py
++++ b/src/olmo_core/nn/bolmo/hf/modeling_bolmo.py
+@@ -446,8 +446,14 @@ class BolmoXLSTMLayer(mLSTMLayer):
+             prev_mode = self.mlstm_backend.config.mode
+             state = past_key_values.get("state", None)
+ 
+-            if cache_mask is not None:
+-                state_for_model = cast(mLSTMLayerStateType, tuple(cache_mask.selective_get(x, inv=True) for x in state) if state is not None else None)
++            # static-shape decode: when the caller passes the FULL batch (x rows == state rows)
++            # we run every row and mask the state write-back instead of gathering the active subset.
++            # per-row-independent recurrence -> bit-identical for active rows, idle rows frozen and
++            # their output discarded upstream; the fixed batch dim lets torch.compile capture the step.
++            static_step = cache_mask is not None and state is not None and x.shape[0] == state[0].shape[0]
++
++            if cache_mask is not None and not static_step:
++                state_for_model = cast(mLSTMLayerStateType, tuple(cache_mask.selective_get(s, inv=True) for s in state) if state is not None else None)
+             else:
+                 state_for_model = state
+ 
+@@ -460,10 +466,15 @@ class BolmoXLSTMLayer(mLSTMLayer):
+ 
+             if state is None or cache_mask is None:
+                 state = new_state
++            elif static_step:
++                # keep frozen (boundary/idle) rows' state, take the new state for active rows
++                state = tuple(
++                    torch.where(cache_mask.mask.view(-1, *([1] * (new_s.dim() - 1))), old_s, new_s)
++                    for old_s, new_s in zip(state, new_state)
++                )
+             else:
+-                if cache_mask is not None:
+-                    for i in range(len(state)):
+-                        cache_mask.selective_put(new_state[i], state[i], inv=True)
++                for i in range(len(state)):
++                    cache_mask.selective_put(new_state[i], state[i], inv=True)
+ 
+             past_key_values["state"] = state
+             self.mlstm_backend.config.mode = prev_mode
+@@ -625,16 +636,18 @@ class BolmoLocalEncoder(nn.Module):
+             # if all batch positions are idle, skip the step entirely
+             # all positions being idle only happens if fuse_boundaries=False. In this case, the step where we
+             # obtain a new representation from the global model will have all positions for the local encoder being idle.
+-            if not pad_state.all():
+-                h = pad_state.selective_get(embeddings, inv=True)
++            # static-shape decode: run every row (fixed batch dim for torch.compile) and mask the
++            # last_h / xLSTM-state update to the active rows; idle (boundary) rows stay frozen.
++            # equivalent to the old selective_get subset since the output is always the full last_h.
++            h = embeddings
+ 
+-                for i, block in enumerate(self.layers):
+-                    h = block(h, past_key_values=self.layer_states[i], use_cache=True, cache_mask=pad_state)
++            for i, block in enumerate(self.layers):
++                h = block(h, past_key_values=self.layer_states[i], use_cache=True, cache_mask=pad_state)
+ 
+-                if self.post_last_block_norm is not None:
+-                    h = self.post_last_block_norm(h)
++            if self.post_last_block_norm is not None:
++                h = self.post_last_block_norm(h)
+ 
+-                pad_state.selective_put(h[:, -1, :], self.last_h, inv=True)
++            self.last_h.copy_(torch.where(pad_state.mask.unsqueeze(-1), self.last_h, h[:, -1, :]))
+ 
+             h = self.last_h.unsqueeze(1)
+         else:
+@@ -741,18 +754,19 @@ class BolmoLocalDecoder(nn.Module):
+                 h = embeds + h_patch
+ 
+                 self.last_value.copy_(h_patch[:, -1])
++
++                # the global fired for the whole (barrier-aligned) batch -> every row advances
++                layer_cache_mask = None
+             else:
+                 h = embeds + self.last_value.unsqueeze(1)
+ 
+-            # skip pad positions until we get a new value from the global model
+-            if patch_embeds.numel() == 0:
+-                h = boundary_state.selective_get(h, inv=True)
+-            else:
+-                boundary_state = None
++                # static-shape decode: run the full batch and freeze idle (at-boundary) rows via
++                # the mask instead of gathering the active subset. Keeps a fixed batch dim for
++                # torch.compile and returns full-batch logits (loop reconciles with `where`).
++                layer_cache_mask = boundary_state
+ 
+-            if h.shape[0] > 0:
+-                for i, layer in enumerate(self.layers):
+-                    h = layer(h, past_key_values=self.layer_states[i], use_cache=True, cache_mask=boundary_state)
++            for i, layer in enumerate(self.layers):
++                h = layer(h, past_key_values=self.layer_states[i], use_cache=True, cache_mask=layer_cache_mask)
+ 
+             self.cache_seqlens += h.shape[1]
+ 
+@@ -1297,33 +1311,29 @@ class BolmoForCausalLM(BolmoPreTrainedModel, GenerationMixin):
+                 tokens_generated_plus_prefilled += 1
+ 
+                 next_tokens = new_next_tokens
+-                next_tokens_cpu = next_tokens.cpu()
+-                for example_idx in range(batch_size):
+-                    if finished[example_idx].item():
+-                        continue
+-
+-                    next_token_cpu = next_tokens_cpu[example_idx].item()
+-
+-                    if next_token_cpu >= boundary_offset:
+-                        next_token_cpu -= boundary_offset
+-
+-                    non_boundary_generated_tokens[example_idx].append(next_token_cpu)
++                # every unfinished example emits a byte token this step
++                emit_mask = ~finished
+             else:
+-                next_tokens[:] = self.model.tokenizer.bpe_token_end_id # type: ignore
+-                boundary_state.selective_put(new_next_tokens, next_tokens, inv=True)
+-                next_tokens_cpu = next_tokens.cpu()
+-
+-                for example_idx in range(batch_size):
+-                    if finished[example_idx].item():
+-                        continue
+-
+-                    next_token_cpu = next_tokens_cpu[example_idx].item()
+-
+-                    if not boundary_state.cpu_mask[example_idx].item():
+-                        if next_token_cpu >= boundary_offset:
+-                            next_token_cpu -= boundary_offset
+-
+-                        non_boundary_generated_tokens[example_idx].append(next_token_cpu)
++                # decoder now returns full-batch logits; non-boundary (mid-patch) rows take their
++                # generated token, boundary (idle) rows keep the bpe_token_end sentinel
++                next_tokens = torch.where(
++                    boundary_state.mask,
++                    torch.full_like(new_next_tokens, self.model.tokenizer.bpe_token_end_id),
++                    new_next_tokens,
++                )
++                # only non-boundary (still mid-patch), unfinished examples emit
++                emit_mask = boundary_state.inv_mask & ~finished
++
++            # strip the boundary offset from the emitted ids on-device; values in non-emitting
++            # slots are ignored by the emit_mask gate below
++            emit_values = torch.where(next_tokens >= boundary_offset, next_tokens - boundary_offset, next_tokens)
++            # two batched D2H copies replace the per-example finished[i].item() / next_tokens[i].item()
++            # syncs (batch_size GPU stalls per step -> 2), the token-append vectorization
++            emit_mask_cpu = emit_mask.tolist()
++            emit_values_cpu = emit_values.tolist()
++            for example_idx in range(batch_size):
++                if emit_mask_cpu[example_idx]:
++                    non_boundary_generated_tokens[example_idx].append(emit_values_cpu[example_idx])
+ 
+             is_first_forward = False
+ 
